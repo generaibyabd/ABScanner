@@ -1,37 +1,64 @@
 package com.abdeveloper.abscanner.camera
 
 import android.annotation.SuppressLint
+import android.os.Handler
+import android.os.Looper
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import com.abdeveloper.abscanner.generator.BarcodeFormatMapper
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
 import com.google.zxing.MultiFormatReader
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
+import java.util.EnumMap
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
+/** One long-lived analysis thread for the whole app (never shut down, so late callbacks can't be rejected). */
+object ScannerExecutor {
+    val instance: Executor = Executors.newSingleThreadExecutor()
+}
+
 class ScannerAnalyzer(
+    private val callbackExecutor: Executor,
     private val onBarcodesDetected: (List<DetectedBarcode>) -> Unit
 ) : ImageAnalysis.Analyzer {
 
     private val isProcessing = AtomicBoolean(false)
     private var lastScanTime = 0L
     private val minScanIntervalMs = 150L
+    private var emptyFrames = 0
 
-    private val options = BarcodeScannerOptions.Builder()
-        .setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS)
-        .build()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val scanner = BarcodeScanning.getClient(options)
-    private val zxingReader = MultiFormatReader()
+    private val scanner = BarcodeScanning.getClient(
+        BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS).build()
+    )
+
+    // ZXing fallback: handles inverted (light-on-dark) codes and symbologies ML Kit misses.
+    private val zxingReader = MultiFormatReader().apply {
+        val hints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java)
+        hints[DecodeHintType.POSSIBLE_FORMATS] = listOf(
+            BarcodeFormat.QR_CODE, BarcodeFormat.DATA_MATRIX, BarcodeFormat.AZTEC, BarcodeFormat.PDF_417,
+            BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A, BarcodeFormat.UPC_E,
+            BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.CODE_93,
+            BarcodeFormat.CODABAR, BarcodeFormat.ITF
+        )
+        hints[DecodeHintType.ALSO_INVERTED] = true
+        setHints(hints)
+    }
 
     @SuppressLint("UnsafeOptInUsageError")
     override fun analyze(imageProxy: ImageProxy) {
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastScanTime < minScanIntervalMs || isProcessing.get()) {
+        val now = System.currentTimeMillis()
+        if (now - lastScanTime < minScanIntervalMs || isProcessing.get()) {
             imageProxy.close()
             return
         }
@@ -43,69 +70,77 @@ class ScannerAnalyzer(
         }
 
         isProcessing.set(true)
-        lastScanTime = currentTime
+        lastScanTime = now
 
         val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
 
+        // All listeners run on the analysis thread (not the main thread), so the heavier
+        // ZXing fallback can never stall the UI.
         scanner.process(inputImage)
-            .addOnSuccessListener { barcodes ->
-                if (barcodes.isNotEmpty()) {
-                    val detected = barcodes.mapNotNull { b ->
-                        val raw = b.rawValue ?: b.displayValue
-                        if (raw != null) {
-                            DetectedBarcode(
-                                rawValue = raw,
-                                formatName = getFormatName(b.format),
-                                boundingBox = b.boundingBox
-                            )
-                        } else null
-                    }
-                    if (detected.isNotEmpty()) {
-                        onBarcodesDetected(detected)
-                    }
+            .addOnSuccessListener(callbackExecutor) { barcodes ->
+                val detected = barcodes.mapNotNull { b ->
+                    val raw = b.rawValue ?: b.displayValue
+                    if (raw != null) DetectedBarcode(raw, getFormatName(b.format), b.boundingBox) else null
+                }
+                if (detected.isNotEmpty()) {
+                    emptyFrames = 0
+                    deliver(detected)
                 } else {
-                    // Fallback to ZXing reader on the luminance buffer (e.g. for inverted codes or niche symbologies)
-                    tryZxingFallback(imageProxy)
+                    emptyFrames++
+                    // Run the (more expensive) fallback on every 3rd empty frame only.
+                    if (emptyFrames % 3 == 0) tryZxingFallback(imageProxy)
                 }
             }
-            .addOnFailureListener {
+            .addOnFailureListener(callbackExecutor) {
                 tryZxingFallback(imageProxy)
             }
-            .addOnCompleteListener {
+            .addOnCompleteListener(callbackExecutor) {
                 isProcessing.set(false)
                 imageProxy.close()
             }
+    }
+
+    private fun deliver(list: List<DetectedBarcode>) {
+        mainHandler.post { onBarcodesDetected(list) }
     }
 
     private fun tryZxingFallback(imageProxy: ImageProxy) {
         try {
             val plane = imageProxy.planes[0]
             val buffer = plane.buffer
+            buffer.rewind()
             val bytes = ByteArray(buffer.remaining())
             buffer.get(bytes)
 
+            val rowStride = plane.rowStride
             val width = imageProxy.width
             val height = imageProxy.height
+            if (rowStride < width || bytes.size < rowStride * (height - 1) + width) return
 
-            val source = PlanarYUVLuminanceSource(
-                bytes, width, height, 0, 0, width, height, false
-            )
-            val binaryBitmap = BinaryBitmap(HybridBinarizer(source))
-            val result = zxingReader.decodeWithState(binaryBitmap)
+            // dataWidth = rowStride: the Y plane can be padded, ignoring it skews the image.
+            val source = PlanarYUVLuminanceSource(bytes, rowStride, height, 0, 0, width, height, false)
+            val result = zxingReader.decodeWithState(BinaryBitmap(HybridBinarizer(source)))
             if (result != null && !result.text.isNullOrEmpty()) {
-                onBarcodesDetected(
+                deliver(
                     listOf(
                         DetectedBarcode(
                             rawValue = result.text,
-                            formatName = result.barcodeFormat.name
+                            formatName = BarcodeFormatMapper.displayName(result.barcodeFormat)
                         )
                     )
                 )
             }
         } catch (_: Exception) {
-            // ZXing fallback failed or code not recognized
+            // Nothing readable in this frame.
         } finally {
             zxingReader.reset()
+        }
+    }
+
+    fun close() {
+        try {
+            scanner.close()
+        } catch (_: Exception) {
         }
     }
 

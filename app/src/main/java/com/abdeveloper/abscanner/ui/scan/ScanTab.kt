@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -110,10 +111,9 @@ fun ScanTab(
     val zoomLevel by viewModel.zoomLevel.collectAsState()
     val isBatchMode by viewModel.isBatchMode.collectAsState()
     val batchScans by viewModel.batchScans.collectAsState()
-    val currentResult by viewModel.currentResult.collectAsState()
-    val isCurrentSaved by viewModel.isCurrentSaved.collectAsState()
     val galleryProcessing by viewModel.galleryProcessing.collectAsState()
     val galleryMessage by viewModel.galleryMessage.collectAsState()
+    val settings by viewModel.userSettings.collectAsState()
 
     var showBatchSheet by remember { mutableStateOf(false) }
 
@@ -122,15 +122,11 @@ fun ScanTab(
             CameraPreviewView(
                 torchEnabled = torchEnabled,
                 zoomLevel = zoomLevel,
-                onBarcodesDetected = { barcodes ->
-                    if (barcodes.isNotEmpty()) {
-                        viewModel.onBarcodeDetected(barcodes.first())
-                    }
-                },
-                onBarcodeSelected = { barcode ->
-                    viewModel.onBarcodeDetected(barcode)
-                },
-                onHasFlashUnitChanged = { viewModel.setFlashAvailable(it) }
+                keepScreenOn = settings.keepScreenOn,
+                onBarcodesDetected = { barcodes -> viewModel.onBarcodesDetected(barcodes) },
+                onBarcodeSelected = { barcode -> viewModel.onBarcodeDetected(barcode) },
+                onHasFlashUnitChanged = { viewModel.setFlashAvailable(it) },
+                onZoomChanged = { viewModel.setZoom(it) }
             )
         } else {
             // Permission Rationale Screen
@@ -195,7 +191,8 @@ fun ScanTab(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 48.dp, start = 16.dp, end = 16.dp),
+                .statusBarsPadding()
+                .padding(top = 8.dp, start = 16.dp, end = 16.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -346,20 +343,6 @@ fun ScanTab(
                         Text(text = "OK")
                     }
                 }
-            )
-        }
-
-        // Scanned Result Sheet
-        currentResult?.let { parsed ->
-            ScanResultDialog(
-                parsed = parsed,
-                isSaved = isCurrentSaved,
-                strings = strings,
-                onDismiss = { viewModel.dismissResult() },
-                onPrimaryAction = { viewModel.executePrimaryAction(parsed) },
-                onCopy = { text, isSensitive -> viewModel.copyToClipboard(text, isSensitive) },
-                onShare = { text -> viewModel.shareText(text) },
-                onToggleSave = { viewModel.toggleCurrentSaved() }
             )
         }
 

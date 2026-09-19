@@ -7,14 +7,25 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.Color as AndroidColor
+import android.media.AudioManager
+import android.media.ExifInterface
+import android.media.MediaScannerConnection
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.PersistableBundle
+import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.widget.Toast
+import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.abdeveloper.abscanner.camera.DetectedBarcode
@@ -22,11 +33,13 @@ import com.abdeveloper.abscanner.codec.CheckDigitValidator
 import com.abdeveloper.abscanner.codec.CodeParser
 import com.abdeveloper.abscanner.codec.CodeType
 import com.abdeveloper.abscanner.codec.ParsedCode
+import com.abdeveloper.abscanner.codec.RiskLevel
 import com.abdeveloper.abscanner.data.AppDatabase
 import com.abdeveloper.abscanner.data.ScanItem
 import com.abdeveloper.abscanner.data.ScanRepository
 import com.abdeveloper.abscanner.data.ScannerPreferences
 import com.abdeveloper.abscanner.data.UserSettings
+import com.abdeveloper.abscanner.generator.BarcodeFormatMapper
 import com.abdeveloper.abscanner.generator.CodeGenerator
 import com.abdeveloper.abscanner.generator.GenerationStyle
 import com.abdeveloper.abscanner.generator.ModuleShape
@@ -37,22 +50,30 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
 import com.google.zxing.MultiFormatReader
 import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
 import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.EnumMap
 import java.util.Locale
+import kotlin.coroutines.resume
 
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -100,8 +121,17 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val _batchScans = MutableStateFlow<List<ScanItem>>(emptyList())
     val batchScans: StateFlow<List<ScanItem>> = _batchScans.asStateFlow()
 
-    private var lastScannedRaw = ""
-    private var lastScannedTimestamp = 0L
+    // Re-arm logic: a code that stays in view is only reported once; it must leave the
+    // camera frame for REARM_GAP_MS before the same value can be reported again.
+    private val seenAt = HashMap<String, Long>()
+
+    private var autoOpenJob: Job? = null
+    private val _autoOpenCountdown = MutableStateFlow<Int?>(null)
+    val autoOpenCountdown: StateFlow<Int?> = _autoOpenCountdown.asStateFlow()
+
+    private companion object {
+        const val REARM_GAP_MS = 1500L
+    }
 
     // Gallery Decoding Status
     private val _galleryProcessing = MutableStateFlow(false)
@@ -140,16 +170,35 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         _batchScans.value = emptyList()
     }
 
-    fun onBarcodeDetected(barcode: DetectedBarcode) {
-        val now = System.currentTimeMillis()
-        if (barcode.rawValue == lastScannedRaw && now - lastScannedTimestamp < 2000L) {
+    fun onBarcodesDetected(list: List<DetectedBarcode>) {
+        val now = SystemClock.uptimeMillis()
+        // Drop values not seen in this frame if enough time has passed so they can re-trigger.
+        val inFrame = list.map { it.rawValue }.toSet()
+        val it = seenAt.entries.iterator()
+        while (it.hasNext()) {
+            val entry = it.next()
+            if (!inFrame.contains(entry.key) && now - entry.value > REARM_GAP_MS) {
+                it.remove()
+            }
+        }
+        val firstNew = list.firstOrNull { !seenAt.containsKey(it.rawValue) } ?: return
+        seenAt[firstNew.rawValue] = now
+        onBarcodeDetected(firstNew, force = false)
+    }
+
+    fun onBarcodeDetected(barcode: DetectedBarcode, force: Boolean = false) {
+        val nowUptime = SystemClock.uptimeMillis()
+        if (!force && seenAt.containsKey(barcode.rawValue) && (nowUptime - (seenAt[barcode.rawValue] ?: 0L)) < REARM_GAP_MS) {
+            // Already handled, don't buzz/reopen dialog.
+            seenAt[barcode.rawValue] = nowUptime
             return
         }
+        seenAt[barcode.rawValue] = nowUptime
 
-        lastScannedRaw = barcode.rawValue
-        lastScannedTimestamp = now
-
+        val now = System.currentTimeMillis()
         val parsed = CodeParser.parse(barcode.rawValue, barcode.formatName)
+
+        feedback()
 
         viewModelScope.launch {
             val item = ScanItem(
@@ -171,11 +220,67 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 _currentResultDbId.value = dbId
                 _isCurrentSaved.value = false
                 _currentResult.value = parsed
+                maybeStartAutoOpen(parsed)
             }
         }
     }
 
+    private fun maybeStartAutoOpen(parsed: ParsedCode) {
+        cancelAutoOpen()
+        val settings = userSettings.value
+        if (!settings.autoOpenLinks) return
+        if (parsed.type != CodeType.URL) return
+        val risk = parsed.urlRisk?.level
+        if (risk == RiskLevel.DANGER || risk == RiskLevel.WARNING) return
+
+        autoOpenJob = viewModelScope.launch {
+            for (sec in 3 downTo 1) {
+                _autoOpenCountdown.value = sec
+                delay(1000)
+            }
+            _autoOpenCountdown.value = null
+            executePrimaryAction(parsed)
+        }
+    }
+
+    fun cancelAutoOpen() {
+        autoOpenJob?.cancel()
+        autoOpenJob = null
+        _autoOpenCountdown.value = null
+    }
+
+    private fun feedback() {
+        val settings = userSettings.value
+        val ctx = getApplication<Application>()
+        if (settings.vibrate) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val vm = ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                    vm.defaultVibrator.vibrate(VibrationEffect.createOneShot(45, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    val vib = ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        vib.vibrate(VibrationEffect.createOneShot(45, VibrationEffect.DEFAULT_AMPLITUDE))
+                    } else {
+                        @Suppress("DEPRECATION")
+                        vib.vibrate(45)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        if (settings.beep) {
+            try {
+                ToneGenerator(AudioManager.STREAM_MUSIC, 70).apply {
+                    startTone(ToneGenerator.TONE_PROP_BEEP, 70)
+                    // ToneGenerator internally plays asynchronously.
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
     fun showResultFor(item: ScanItem) {
+        cancelAutoOpen()
         val parsed = CodeParser.parse(item.rawValue, item.formatName)
         _currentResult.value = parsed
         _currentResultDbId.value = item.id
@@ -183,6 +288,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun dismissResult() {
+        cancelAutoOpen()
         _currentResult.value = null
         _currentResultDbId.value = null
         _isCurrentSaved.value = false
@@ -223,76 +329,148 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     // Decode image chosen from Gallery / PhotoPicker
     fun decodeGalleryUri(uri: Uri) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             _galleryProcessing.value = true
             _galleryMessage.value = null
             try {
                 val context = getApplication<Application>()
-                val inputStream = context.contentResolver.openInputStream(uri)
-                val bitmap = BitmapFactory.decodeStream(inputStream)
-                inputStream?.close()
-
+                val bitmap = loadBitmapForDecoding(context, uri)
                 if (bitmap == null) {
-                    _galleryMessage.value = "Failed to load image format."
-                    _galleryProcessing.value = false
+                    withContext(Dispatchers.Main) {
+                        _galleryMessage.value = "Failed to load image format."
+                        _galleryProcessing.value = false
+                    }
                     return@launch
                 }
 
-                // First Pass: ML Kit Barcode Scanner
-                val inputImage = InputImage.fromBitmap(bitmap, 0)
-                val options = BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS).build()
-                val client = BarcodeScanning.getClient(options)
-
-                client.process(inputImage)
-                    .addOnSuccessListener { barcodes ->
-                        if (barcodes.isNotEmpty()) {
-                            val first = barcodes.first()
-                            val raw = first.rawValue ?: first.displayValue ?: ""
-                            val format = getFormatName(first.format)
-                            onBarcodeDetected(DetectedBarcode(raw, format))
-                            _galleryProcessing.value = false
-                        } else {
-                            // Second Pass: ZXing on Luminance Source
-                            decodeWithZxing(bitmap)
-                        }
-                    }
-                    .addOnFailureListener {
-                        decodeWithZxing(bitmap)
-                    }
-            } catch (e: Exception) {
-                _galleryMessage.value = "Error reading image: ${e.localizedMessage}"
-                _galleryProcessing.value = false
-            }
-        }
-    }
-
-    private fun decodeWithZxing(bitmap: Bitmap) {
-        viewModelScope.launch(Dispatchers.Default) {
-            try {
-                val width = bitmap.width
-                val height = bitmap.height
-                val pixels = IntArray(width * height)
-                bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
-
-                val source = RGBLuminanceSource(width, height, pixels)
-                val binaryBitmap = BinaryBitmap(HybridBinarizer(source))
-                val reader = MultiFormatReader()
-                val result = reader.decodeWithState(binaryBitmap)
-
+                val detected = decodeBitmapAllPasses(bitmap)
                 withContext(Dispatchers.Main) {
                     _galleryProcessing.value = false
-                    if (result != null && !result.text.isNullOrEmpty()) {
-                        onBarcodeDetected(DetectedBarcode(result.text, result.barcodeFormat.name))
+                    if (detected != null) {
+                        // force = true so gallery scans always open even if the value matches a recent live scan
+                        onBarcodeDetected(detected, force = true)
                     } else {
                         _galleryMessage.value = "No code found in this image. Tip: crop closer or try another image."
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
+                    _galleryMessage.value = "Error reading image: ${e.localizedMessage}"
                     _galleryProcessing.value = false
-                    _galleryMessage.value = "No code found in this image. Tip: crop closer or try another image."
                 }
             }
+        }
+    }
+
+    private fun loadBitmapForDecoding(context: Context, uri: Uri): Bitmap? {
+        val cr = context.contentResolver
+        // First pass: read bounds only.
+        val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, boundsOpts) } ?: return null
+        if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
+
+        // Downsample so max dimension <= 2048 to prevent OOM on 50+ MP phone photos.
+        val maxDim = maxOf(boundsOpts.outWidth, boundsOpts.outHeight)
+        var sampleSize = 1
+        while (maxDim / sampleSize > 2048) {
+            sampleSize *= 2
+        }
+
+        val decodeOpts = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val rawBitmap = cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, decodeOpts) } ?: return null
+
+        // Handle EXIF orientation so rotated photos decode right-side up.
+        val rotationDegrees = try {
+            cr.openInputStream(uri)?.use { stream ->
+                val exif = ExifInterface(stream)
+                when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+            } ?: 0
+        } catch (_: Exception) { 0 }
+
+        return if (rotationDegrees != 0) {
+            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+            val rotated = Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+            if (rotated != rawBitmap) rawBitmap.recycle()
+            rotated
+        } else {
+            rawBitmap
+        }
+    }
+
+    private suspend fun decodeBitmapAllPasses(bitmap: Bitmap): DetectedBarcode? {
+        // Pass 1: ML Kit on original bitmap.
+        mlKitDecode(bitmap)?.let { return it }
+
+        // Pass 2: ZXing with ALSO_INVERTED on original bitmap.
+        zxingDecode(bitmap, inverted = false)?.let { return it }
+        zxingDecode(bitmap, inverted = true)?.let { return it }
+
+        // Pass 3: Center-crop (50% scale, center area) for busy photos.
+        val cw = (bitmap.width * 0.7f).toInt().coerceAtLeast(1)
+        val ch = (bitmap.height * 0.7f).toInt().coerceAtLeast(1)
+        val cx = (bitmap.width - cw) / 2
+        val cy = (bitmap.height - ch) / 2
+        val cropped = Bitmap.createBitmap(bitmap, cx, cy, cw, ch)
+        try {
+            mlKitDecode(cropped)?.let { return it }
+            zxingDecode(cropped, inverted = false)?.let { return it }
+        } finally {
+            if (cropped != bitmap) cropped.recycle()
+        }
+
+        return null
+    }
+
+    private suspend fun mlKitDecode(bitmap: Bitmap): DetectedBarcode? =
+        suspendCancellableCoroutine { cont ->
+            val inputImage = InputImage.fromBitmap(bitmap, 0)
+            val options = BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS).build()
+            val client = BarcodeScanning.getClient(options)
+            client.process(inputImage)
+                .addOnSuccessListener { barcodes ->
+                    val first = barcodes.firstOrNull()
+                    val raw = first?.rawValue ?: first?.displayValue
+                    if (first != null && raw != null) {
+                        cont.resume(DetectedBarcode(raw, getFormatName(first.format)))
+                    } else {
+                        cont.resume(null)
+                    }
+                }
+                .addOnFailureListener { cont.resume(null) }
+        }
+
+    private fun zxingDecode(bitmap: Bitmap, inverted: Boolean): DetectedBarcode? {
+        return try {
+            val width = bitmap.width
+            val height = bitmap.height
+            val pixels = IntArray(width * height)
+            bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+            val source = RGBLuminanceSource(width, height, pixels)
+            val finalSource = if (inverted) source.invert() else source
+            val binaryBitmap = BinaryBitmap(HybridBinarizer(finalSource))
+            val hints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java).apply {
+                put(DecodeHintType.TRY_HARDER, true)
+                put(DecodeHintType.POSSIBLE_FORMATS, listOf(
+                    BarcodeFormat.QR_CODE, BarcodeFormat.DATA_MATRIX, BarcodeFormat.AZTEC, BarcodeFormat.PDF_417,
+                    BarcodeFormat.EAN_13, BarcodeFormat.EAN_8, BarcodeFormat.UPC_A, BarcodeFormat.UPC_E,
+                    BarcodeFormat.CODE_128, BarcodeFormat.CODE_39, BarcodeFormat.CODE_93, BarcodeFormat.CODABAR, BarcodeFormat.ITF
+                ))
+            }
+            val reader = MultiFormatReader().apply { setHints(hints) }
+            val result = reader.decodeWithState(binaryBitmap)
+            if (result != null && !result.text.isNullOrEmpty()) {
+                DetectedBarcode(result.text, BarcodeFormatMapper.displayName(result.barcodeFormat))
+            } else null
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -324,7 +502,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     logoBitmap = logo
                 )
                 val bmp = CodeGenerator.generate(content, style)
-                val verification = ScannabilityVerifier.verify(bmp, content)
+                val verification = ScannabilityVerifier.verify(bmp, content, format)
 
                 withContext(Dispatchers.Main) {
                     _generatedBitmap.value = bmp
@@ -351,11 +529,12 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun saveGeneratedToHistory(content: String, format: BarcodeFormat) {
         viewModelScope.launch {
-            val parsed = CodeParser.parse(content, format.name)
+            val formatLabel = BarcodeFormatMapper.displayName(format)
+            val parsed = CodeParser.parse(content, formatLabel)
             repository.insertScan(
                 ScanItem(
                     rawValue = content,
-                    formatName = format.name,
+                    formatName = formatLabel,
                     codeType = parsed.type.name,
                     title = parsed.title,
                     subtitle = parsed.subtitle,
@@ -370,35 +549,41 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun saveBitmapToGallery(bitmap: Bitmap, filename: String = "ABScanner_${System.currentTimeMillis()}") {
         val context = getApplication<Application>()
-        try {
-            val values = android.content.ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "$filename.png")
-                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ABScanner")
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
-            }
-
-            val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            if (uri != null) {
-                val out: OutputStream? = context.contentResolver.openOutputStream(uri)
-                if (out != null) {
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                    out.flush()
-                    out.close()
-                }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val values = android.content.ContentValues().apply {
+                        put(MediaStore.Images.Media.DISPLAY_NAME, "$filename.png")
+                        put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ABScanner")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                    val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("MediaStore insert failed")
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
                     values.clear()
                     values.put(MediaStore.Images.Media.IS_PENDING, 0)
                     context.contentResolver.update(uri, values, null, null)
+                } else {
+                    @Suppress("DEPRECATION")
+                    val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "ABScanner")
+                    if (!dir.exists()) dir.mkdirs()
+                    val file = File(dir, "$filename.png")
+                    FileOutputStream(file).use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                    MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), arrayOf("image/png"), null)
                 }
-
-                Toast.makeText(context, "Saved image to Pictures/ABScanner", Toast.LENGTH_SHORT).show()
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Saved image to Pictures/ABScanner", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Failed to save image: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                }
             }
-        } catch (e: Exception) {
-            Toast.makeText(context, "Failed to save image: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -413,7 +598,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             clip.description.extras = extras
         }
         clipboard.setPrimaryClip(clip)
-        Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+        }
     }
 
     fun shareText(text: String) {
@@ -431,20 +618,30 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun shareBitmap(bitmap: Bitmap) {
         val context = getApplication<Application>()
-        try {
-            val path = MediaStore.Images.Media.insertImage(context.contentResolver, bitmap, "ABScanner_Share", null)
-            val uri = Uri.parse(path)
-            val intent = Intent(Intent.ACTION_SEND).apply {
-                type = "image/png"
-                putExtra(Intent.EXTRA_STREAM, uri)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val shareDir = File(context.cacheDir, "shared_images").apply { mkdirs() }
+                val file = File(shareDir, "share_${System.currentTimeMillis()}.png")
+                FileOutputStream(file).use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                }
+                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "image/png"
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                val chooser = Intent.createChooser(intent, "Share code image").apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
+                withContext(Dispatchers.Main) {
+                    context.startActivity(chooser)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Failed to share image: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                }
             }
-            val chooser = Intent.createChooser(intent, "Share code image").apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(chooser)
-        } catch (_: Exception) {
-            shareText(lastScannedRaw)
         }
     }
 
@@ -454,7 +651,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
         try {
             when (parsed.type) {
                 CodeType.URL -> {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(parsed.rawValue)).apply {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(parsed.primaryActionIntentUri ?: parsed.rawValue.trim())).apply {
                         flags = Intent.FLAG_ACTIVITY_NEW_TASK
                     }
                     context.startActivity(intent)

@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import com.abdeveloper.abscanner.ui.create.CreateTab
 import com.abdeveloper.abscanner.ui.i18n.AppLocales
 import com.abdeveloper.abscanner.ui.i18n.Strings
+import com.abdeveloper.abscanner.ui.scan.ScanResultDialog
 import com.abdeveloper.abscanner.ui.scan.ScanTab
 import com.abdeveloper.abscanner.ui.settings.SettingsTab
 import com.abdeveloper.abscanner.ui.theme.BrandBlue
@@ -43,6 +44,9 @@ import com.abdeveloper.abscanner.ui.theme.BrandBlue
 @Composable
 fun MainScreen(viewModel: ScannerViewModel) {
     val settings by viewModel.userSettings.collectAsState()
+    val currentResult by viewModel.currentResult.collectAsState()
+    val isCurrentSaved by viewModel.isCurrentSaved.collectAsState()
+    val autoOpenCountdown by viewModel.autoOpenCountdown.collectAsState()
     val strings = remember(settings.languageCode) { Strings(settings.languageCode) }
     val isRtl = remember(settings.languageCode) { AppLocales.getLanguage(settings.languageCode).isRtl }
     val layoutDirection = if (isRtl) LayoutDirection.Rtl else LayoutDirection.Ltr
@@ -184,6 +188,22 @@ fun MainScreen(viewModel: ScannerViewModel) {
                         2 -> SettingsTab(viewModel = viewModel, strings = strings, modifier = Modifier.padding(padding))
                     }
                 }
+            }
+
+            // Universal Scanned Result Sheet
+            currentResult?.let { parsed ->
+                ScanResultDialog(
+                    parsed = parsed,
+                    isSaved = isCurrentSaved,
+                    strings = strings,
+                    autoOpenCountdown = autoOpenCountdown,
+                    onCancelAutoOpen = { viewModel.cancelAutoOpen() },
+                    onDismiss = { viewModel.dismissResult() },
+                    onPrimaryAction = { viewModel.executePrimaryAction(parsed) },
+                    onCopy = { text, isSensitive -> viewModel.copyToClipboard(text, isSensitive) },
+                    onShare = { text -> viewModel.shareText(text) },
+                    onToggleSave = { viewModel.toggleCurrentSaved() }
+                )
             }
         }
     }

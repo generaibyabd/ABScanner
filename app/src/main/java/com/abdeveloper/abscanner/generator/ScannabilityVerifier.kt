@@ -1,6 +1,7 @@
 package com.abdeveloper.abscanner.generator
 
 import android.graphics.Bitmap
+import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
 import com.google.zxing.MultiFormatReader
@@ -16,7 +17,15 @@ object ScannabilityVerifier {
         val errorMessage: String? = null
     )
 
-    fun verify(bitmap: Bitmap, expectedContent: String): VerificationResult {
+    /**
+     * Decodes the generated bitmap again. Restricting to the generated [format] keeps this fast
+     * and avoids false matches from unrelated symbologies.
+     */
+    fun verify(
+        bitmap: Bitmap,
+        expectedContent: String,
+        format: BarcodeFormat? = null
+    ): VerificationResult {
         return try {
             val width = bitmap.width
             val height = bitmap.height
@@ -28,15 +37,18 @@ object ScannabilityVerifier {
 
             val hints = EnumMap<DecodeHintType, Any>(DecodeHintType::class.java)
             hints[DecodeHintType.TRY_HARDER] = true
-            hints[DecodeHintType.POSSIBLE_FORMATS] = com.google.zxing.BarcodeFormat.values().toList()
+            hints[DecodeHintType.CHARACTER_SET] = "UTF-8"
+            if (format != null) {
+                hints[DecodeHintType.POSSIBLE_FORMATS] = listOf(format)
+            }
 
-            val reader = MultiFormatReader()
-            val result = reader.decode(binaryBitmap, hints)
+            val result = MultiFormatReader().decode(binaryBitmap, hints)
             val decoded = result.text
 
             if (decoded == expectedContent) {
                 VerificationResult(isScannable = true, decodedText = decoded)
             } else {
+                // Some symbologies legitimately differ (e.g. an added check digit); still readable.
                 VerificationResult(
                     isScannable = true,
                     decodedText = decoded,
@@ -46,7 +58,7 @@ object ScannabilityVerifier {
         } catch (e: Exception) {
             VerificationResult(
                 isScannable = false,
-                errorMessage = "Code verification failed: ${e.localizedMessage ?: "Contrast or styling makes code unreadable"}"
+                errorMessage = "Code verification failed: contrast, colors or size make this code hard to read."
             )
         }
     }

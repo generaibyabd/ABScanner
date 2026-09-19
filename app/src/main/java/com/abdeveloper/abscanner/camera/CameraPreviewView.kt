@@ -2,7 +2,9 @@ package com.abdeveloper.abscanner.camera
 
 import android.annotation.SuppressLint
 import android.graphics.Rect
+import android.view.GestureDetector
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
@@ -19,7 +21,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,9 +33,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,14 +46,11 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import java.util.concurrent.Executors
 
 @SuppressLint("ClickableViewAccessibility")
 @Composable
@@ -60,21 +58,37 @@ fun CameraPreviewView(
     modifier: Modifier = Modifier,
     torchEnabled: Boolean = false,
     zoomLevel: Float = 1.0f,
+    keepScreenOn: Boolean = true,
     detectedBarcodes: List<DetectedBarcode> = emptyList(),
     onBarcodesDetected: (List<DetectedBarcode>) -> Unit,
     onBarcodeSelected: (DetectedBarcode) -> Unit,
-    onHasFlashUnitChanged: (Boolean) -> Unit = {}
+    onHasFlashUnitChanged: (Boolean) -> Unit = {},
+    onZoomChanged: (Float) -> Unit = {}
 ) {
-    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     var camera by remember { mutableStateOf<Camera?>(null) }
-    var currentZoom by remember { mutableFloatStateOf(zoomLevel) }
+    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
 
-    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    // The camera factory below runs once; these keep it reading the latest callbacks/values.
+    val latestOnBarcodes = rememberUpdatedState(onBarcodesDetected)
+    val latestOnFlash = rememberUpdatedState(onHasFlashUnitChanged)
+    val latestOnZoom = rememberUpdatedState(onZoomChanged)
+    val latestZoom = rememberUpdatedState(zoomLevel)
 
+    val analyzer = remember {
+        ScannerAnalyzer(ScannerExecutor.instance) { latestOnBarcodes.value(it) }
+    }
+
+    // Leaving the Scan tab MUST release the camera. Without this the camera stayed open in the
+    // background (privacy indicator, battery) and kept delivering scans while on other tabs.
     DisposableEffect(Unit) {
         onDispose {
-            cameraExecutor.shutdown()
+            try {
+                cameraProvider?.unbindAll()
+            } catch (_: Exception) {
+            }
+            camera = null
+            analyzer.close()
         }
     }
 
@@ -83,24 +97,14 @@ fun CameraPreviewView(
     }
 
     LaunchedEffect(zoomLevel, camera) {
-        camera?.cameraControl?.setZoomRatio(zoomLevel)
-        currentZoom = zoomLevel
+        val cam = camera ?: return@LaunchedEffect
+        val max = cam.cameraInfo.zoomState.value?.maxZoomRatio ?: zoomLevel
+        cam.cameraControl.setZoomRatio(zoomLevel.coerceIn(1.0f, max.coerceAtLeast(1.0f)))
     }
 
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        val widthPx = constraints.maxWidth.toFloat()
-        val heightPx = constraints.maxHeight.toFloat()
-
         AndroidView(
-            modifier = Modifier
-                .fillMaxSize()
-                .pointerInput(Unit) {
-                    detectTransformGestures { _, _, zoom, _ ->
-                        val newZoom = (currentZoom * zoom).coerceIn(1.0f, 10.0f)
-                        currentZoom = newZoom
-                        camera?.cameraControl?.setZoomRatio(newZoom)
-                    }
-                },
+            modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
                 val previewView = PreviewView(ctx).apply {
                     scaleType = PreviewView.ScaleType.FILL_CENTER
@@ -108,48 +112,68 @@ fun CameraPreviewView(
 
                 val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                 cameraProviderFuture.addListener({
-                    val cameraProvider = cameraProviderFuture.get()
-                    val preview = Preview.Builder().build().also {
-                        it.surfaceProvider = previewView.surfaceProvider
-                    }
-
-                    val imageAnalysis = ImageAnalysis.Builder()
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-                        .also {
-                            it.setAnalyzer(cameraExecutor, ScannerAnalyzer(onBarcodesDetected))
+                    try {
+                        val provider = cameraProviderFuture.get()
+                        cameraProvider = provider
+                        val preview = Preview.Builder().build().also {
+                            it.surfaceProvider = previewView.surfaceProvider
                         }
 
-                    val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                        val imageAnalysis = ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build()
+                            .also { it.setAnalyzer(ScannerExecutor.instance, analyzer) }
 
-                    try {
-                        cameraProvider.unbindAll()
-                        val cam = cameraProvider.bindToLifecycle(
+                        provider.unbindAll()
+                        val cam = provider.bindToLifecycle(
                             lifecycleOwner,
-                            cameraSelector,
+                            CameraSelector.DEFAULT_BACK_CAMERA,
                             preview,
                             imageAnalysis
                         )
                         camera = cam
-                        onHasFlashUnitChanged(cam.cameraInfo.hasFlashUnit())
+                        latestOnFlash.value(cam.cameraInfo.hasFlashUnit())
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
                 }, ContextCompat.getMainExecutor(ctx))
 
-                previewView.setOnTouchListener { v, event ->
-                    if (event.action == MotionEvent.ACTION_UP) {
-                        val factory = previewView.meteringPointFactory
-                        val point = factory.createPoint(event.x, event.y)
-                        val action = FocusMeteringAction.Builder(point).build()
-                        camera?.cameraControl?.startFocusAndMetering(action)
-                        v.performClick()
+                // Pinch-to-zoom + tap-to-focus. Handled with classic View detectors because the
+                // PreviewView consumes touches before Compose pointer input could see them.
+                val scaleDetector = ScaleGestureDetector(
+                    ctx,
+                    object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                        override fun onScale(detector: ScaleGestureDetector): Boolean {
+                            val max = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1.0f
+                            val newZoom = (latestZoom.value * detector.scaleFactor)
+                                .coerceIn(1.0f, max.coerceAtLeast(1.0f))
+                            latestOnZoom.value(newZoom)
+                            return true
+                        }
                     }
+                )
+                val tapDetector = GestureDetector(
+                    ctx,
+                    object : GestureDetector.SimpleOnGestureListener() {
+                        override fun onDown(e: MotionEvent): Boolean = true
+
+                        override fun onSingleTapUp(e: MotionEvent): Boolean {
+                            val point = previewView.meteringPointFactory.createPoint(e.x, e.y)
+                            camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(point).build())
+                            return true
+                        }
+                    }
+                )
+                previewView.setOnTouchListener { v, event ->
+                    scaleDetector.onTouchEvent(event)
+                    tapDetector.onTouchEvent(event)
+                    if (event.action == MotionEvent.ACTION_UP) v.performClick()
                     true
                 }
 
                 previewView
-            }
+            },
+            update = { view -> view.keepScreenOn = keepScreenOn }
         )
 
         // Viewfinder overlay

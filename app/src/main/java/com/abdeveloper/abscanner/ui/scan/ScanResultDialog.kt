@@ -47,6 +47,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -75,6 +76,8 @@ fun ScanResultDialog(
     parsed: ParsedCode,
     isSaved: Boolean,
     strings: Strings,
+    autoOpenCountdown: Int? = null,
+    onCancelAutoOpen: () -> Unit = {},
     onDismiss: () -> Unit,
     onPrimaryAction: () -> Unit,
     onCopy: (String, Boolean) -> Unit,
@@ -359,6 +362,33 @@ fun ScanResultDialog(
 
             Spacer(modifier = Modifier.height(20.dp))
 
+            // Auto-open countdown banner
+            if (autoOpenCountdown != null) {
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = BrandBlue.copy(alpha = 0.15f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Opening link in ${autoOpenCountdown}s...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = BrandBlue
+                        )
+                        TextButton(onClick = onCancelAutoOpen) {
+                            Text(text = "Cancel", color = BrandBlue, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
             // Primary Action Button
             if (!parsed.primaryActionTitle.isNullOrEmpty()) {
                 Button(
@@ -368,7 +398,7 @@ fun ScanResultDialog(
                     colors = ButtonDefaults.buttonColors(containerColor = BrandBlue)
                 ) {
                     Text(
-                        text = parsed.primaryActionTitle,
+                        text = if (autoOpenCountdown != null) "${parsed.primaryActionTitle} (${autoOpenCountdown}s)" else parsed.primaryActionTitle,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = Color.White,
