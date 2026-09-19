@@ -1,0 +1,6 @@
+{
+  "name": "ABScanner",
+  "description": "Fast, private, fully offline scanner & generator for QR codes and barcodes with smart content recognition and safety inspection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

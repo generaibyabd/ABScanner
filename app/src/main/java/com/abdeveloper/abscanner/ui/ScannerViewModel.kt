@@ -1,0 +1,577 @@
+package com.abdeveloper.abscanner.ui
+
+import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color as AndroidColor
+import android.net.Uri
+import android.os.Build
+import android.os.PersistableBundle
+import android.provider.CalendarContract
+import android.provider.ContactsContract
+import android.provider.MediaStore
+import android.widget.Toast
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.abdeveloper.abscanner.camera.DetectedBarcode
+import com.abdeveloper.abscanner.codec.CheckDigitValidator
+import com.abdeveloper.abscanner.codec.CodeParser
+import com.abdeveloper.abscanner.codec.CodeType
+import com.abdeveloper.abscanner.codec.ParsedCode
+import com.abdeveloper.abscanner.data.AppDatabase
+import com.abdeveloper.abscanner.data.ScanItem
+import com.abdeveloper.abscanner.data.ScanRepository
+import com.abdeveloper.abscanner.data.ScannerPreferences
+import com.abdeveloper.abscanner.data.UserSettings
+import com.abdeveloper.abscanner.generator.CodeGenerator
+import com.abdeveloper.abscanner.generator.GenerationStyle
+import com.abdeveloper.abscanner.generator.ModuleShape
+import com.abdeveloper.abscanner.generator.ScannabilityVerifier
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.RGBLuminanceSource
+import com.google.zxing.common.HybridBinarizer
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.OutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class ScannerViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val repository: ScanRepository
+
+    init {
+        val db = AppDatabase.getInstance(application)
+        val prefs = ScannerPreferences(application)
+        repository = ScanRepository(db.scanDao(), prefs)
+    }
+
+    val historyList: StateFlow<List<ScanItem>> = repository.historyFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val savedList: StateFlow<List<ScanItem>> = repository.savedFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val userSettings: StateFlow<UserSettings> = repository.settingsFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserSettings())
+
+    // Current Scanned Result View
+    private val _currentResult = MutableStateFlow<ParsedCode?>(null)
+    val currentResult: StateFlow<ParsedCode?> = _currentResult.asStateFlow()
+
+    private val _currentResultDbId = MutableStateFlow<Long?>(null)
+    val currentResultDbId: StateFlow<Long?> = _currentResultDbId.asStateFlow()
+
+    private val _isCurrentSaved = MutableStateFlow(false)
+    val isCurrentSaved: StateFlow<Boolean> = _isCurrentSaved.asStateFlow()
+
+    // Camera Controls State
+    private val _torchEnabled = MutableStateFlow(false)
+    val torchEnabled: StateFlow<Boolean> = _torchEnabled.asStateFlow()
+
+    private val _hasFlashUnit = MutableStateFlow(true)
+    val hasFlashUnit: StateFlow<Boolean> = _hasFlashUnit.asStateFlow()
+
+    private val _zoomLevel = MutableStateFlow(1.0f)
+    val zoomLevel: StateFlow<Float> = _zoomLevel.asStateFlow()
+
+    // Batch Scanning State
+    private val _isBatchMode = MutableStateFlow(false)
+    val isBatchMode: StateFlow<Boolean> = _isBatchMode.asStateFlow()
+
+    private val _batchScans = MutableStateFlow<List<ScanItem>>(emptyList())
+    val batchScans: StateFlow<List<ScanItem>> = _batchScans.asStateFlow()
+
+    private var lastScannedRaw = ""
+    private var lastScannedTimestamp = 0L
+
+    // Gallery Decoding Status
+    private val _galleryProcessing = MutableStateFlow(false)
+    val galleryProcessing: StateFlow<Boolean> = _galleryProcessing.asStateFlow()
+
+    private val _galleryMessage = MutableStateFlow<String?>(null)
+    val galleryMessage: StateFlow<String?> = _galleryMessage.asStateFlow()
+
+    // Generation State
+    private val _generatedBitmap = MutableStateFlow<Bitmap?>(null)
+    val generatedBitmap: StateFlow<Bitmap?> = _generatedBitmap.asStateFlow()
+
+    private val _generationVerification = MutableStateFlow<ScannabilityVerifier.VerificationResult?>(null)
+    val generationVerification: StateFlow<ScannabilityVerifier.VerificationResult?> = _generationVerification.asStateFlow()
+
+    private val _isGenerating = MutableStateFlow(false)
+    val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
+
+    fun toggleTorch() {
+        _torchEnabled.value = !_torchEnabled.value
+    }
+
+    fun setFlashAvailable(available: Boolean) {
+        _hasFlashUnit.value = available
+    }
+
+    fun setZoom(zoom: Float) {
+        _zoomLevel.value = zoom.coerceIn(1.0f, 10.0f)
+    }
+
+    fun toggleBatchMode() {
+        _isBatchMode.value = !_isBatchMode.value
+    }
+
+    fun clearBatch() {
+        _batchScans.value = emptyList()
+    }
+
+    fun onBarcodeDetected(barcode: DetectedBarcode) {
+        val now = System.currentTimeMillis()
+        if (barcode.rawValue == lastScannedRaw && now - lastScannedTimestamp < 2000L) {
+            return
+        }
+
+        lastScannedRaw = barcode.rawValue
+        lastScannedTimestamp = now
+
+        val parsed = CodeParser.parse(barcode.rawValue, barcode.formatName)
+
+        viewModelScope.launch {
+            val item = ScanItem(
+                rawValue = barcode.rawValue,
+                formatName = barcode.formatName,
+                codeType = parsed.type.name,
+                title = parsed.title,
+                subtitle = parsed.subtitle,
+                timestamp = now,
+                isSaved = false,
+                isCreated = false
+            )
+
+            if (_isBatchMode.value) {
+                _batchScans.value = listOf(item) + _batchScans.value
+                repository.insertScan(item)
+            } else {
+                val dbId = repository.insertScan(item)
+                _currentResultDbId.value = dbId
+                _isCurrentSaved.value = false
+                _currentResult.value = parsed
+            }
+        }
+    }
+
+    fun showResultFor(item: ScanItem) {
+        val parsed = CodeParser.parse(item.rawValue, item.formatName)
+        _currentResult.value = parsed
+        _currentResultDbId.value = item.id
+        _isCurrentSaved.value = item.isSaved
+    }
+
+    fun dismissResult() {
+        _currentResult.value = null
+        _currentResultDbId.value = null
+        _isCurrentSaved.value = false
+    }
+
+    fun toggleCurrentSaved() {
+        val id = _currentResultDbId.value ?: return
+        val current = _isCurrentSaved.value
+        _isCurrentSaved.value = !current
+        viewModelScope.launch {
+            repository.toggleSaved(id, current)
+        }
+    }
+
+    fun toggleSavedItem(item: ScanItem) {
+        viewModelScope.launch {
+            repository.toggleSaved(item.id, item.isSaved)
+        }
+    }
+
+    fun deleteItem(item: ScanItem) {
+        viewModelScope.launch {
+            repository.deleteScan(item.id)
+        }
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch {
+            repository.clearHistoryOnly()
+        }
+    }
+
+    fun clearAllData() {
+        viewModelScope.launch {
+            repository.clearAll()
+        }
+    }
+
+    // Decode image chosen from Gallery / PhotoPicker
+    fun decodeGalleryUri(uri: Uri) {
+        viewModelScope.launch {
+            _galleryProcessing.value = true
+            _galleryMessage.value = null
+            try {
+                val context = getApplication<Application>()
+                val inputStream = context.contentResolver.openInputStream(uri)
+                val bitmap = BitmapFactory.decodeStream(inputStream)
+                inputStream?.close()
+
+                if (bitmap == null) {
+                    _galleryMessage.value = "Failed to load image format."
+                    _galleryProcessing.value = false
+                    return@launch
+                }
+
+                // First Pass: ML Kit Barcode Scanner
+                val inputImage = InputImage.fromBitmap(bitmap, 0)
+                val options = BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_ALL_FORMATS).build()
+                val client = BarcodeScanning.getClient(options)
+
+                client.process(inputImage)
+                    .addOnSuccessListener { barcodes ->
+                        if (barcodes.isNotEmpty()) {
+                            val first = barcodes.first()
+                            val raw = first.rawValue ?: first.displayValue ?: ""
+                            val format = getFormatName(first.format)
+                            onBarcodeDetected(DetectedBarcode(raw, format))
+                            _galleryProcessing.value = false
+                        } else {
+                            // Second Pass: ZXing on Luminance Source
+                            decodeWithZxing(bitmap)
+                        }
+                    }
+                    .addOnFailureListener {
+                        decodeWithZxing(bitmap)
+                    }
+            } catch (e: Exception) {
+                _galleryMessage.value = "Error reading image: ${e.localizedMessage}"
+                _galleryProcessing.value = false
+            }
+        }
+    }
+
+    private fun decodeWithZxing(bitmap: Bitmap) {
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val width = bitmap.width
+                val height = bitmap.height
+                val pixels = IntArray(width * height)
+                bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+                val source = RGBLuminanceSource(width, height, pixels)
+                val binaryBitmap = BinaryBitmap(HybridBinarizer(source))
+                val reader = MultiFormatReader()
+                val result = reader.decodeWithState(binaryBitmap)
+
+                withContext(Dispatchers.Main) {
+                    _galleryProcessing.value = false
+                    if (result != null && !result.text.isNullOrEmpty()) {
+                        onBarcodeDetected(DetectedBarcode(result.text, result.barcodeFormat.name))
+                    } else {
+                        _galleryMessage.value = "No code found in this image. Tip: crop closer or try another image."
+                    }
+                }
+            } catch (_: Exception) {
+                withContext(Dispatchers.Main) {
+                    _galleryProcessing.value = false
+                    _galleryMessage.value = "No code found in this image. Tip: crop closer or try another image."
+                }
+            }
+        }
+    }
+
+    fun dismissGalleryMessage() {
+        _galleryMessage.value = null
+    }
+
+    // Code Generator
+    fun generateCode(
+        content: String,
+        format: BarcodeFormat,
+        foregroundColor: Int = AndroidColor.BLACK,
+        backgroundColor: Int = AndroidColor.WHITE,
+        shape: ModuleShape = ModuleShape.SQUARE,
+        ecc: ErrorCorrectionLevel = ErrorCorrectionLevel.M,
+        logo: Bitmap? = null
+    ) {
+        viewModelScope.launch(Dispatchers.Default) {
+            _isGenerating.value = true
+            try {
+                val style = GenerationStyle(
+                    format = format,
+                    width = 800,
+                    height = 800,
+                    foregroundColor = foregroundColor,
+                    backgroundColor = backgroundColor,
+                    moduleShape = shape,
+                    eccLevel = ecc,
+                    logoBitmap = logo
+                )
+                val bmp = CodeGenerator.generate(content, style)
+                val verification = ScannabilityVerifier.verify(bmp, content)
+
+                withContext(Dispatchers.Main) {
+                    _generatedBitmap.value = bmp
+                    _generationVerification.value = verification
+                    _isGenerating.value = false
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    _generatedBitmap.value = null
+                    _generationVerification.value = ScannabilityVerifier.VerificationResult(
+                        isScannable = false,
+                        errorMessage = e.localizedMessage ?: "Encoding failed"
+                    )
+                    _isGenerating.value = false
+                }
+            }
+        }
+    }
+
+    fun dismissGenerated() {
+        _generatedBitmap.value = null
+        _generationVerification.value = null
+    }
+
+    fun saveGeneratedToHistory(content: String, format: BarcodeFormat) {
+        viewModelScope.launch {
+            val parsed = CodeParser.parse(content, format.name)
+            repository.insertScan(
+                ScanItem(
+                    rawValue = content,
+                    formatName = format.name,
+                    codeType = parsed.type.name,
+                    title = parsed.title,
+                    subtitle = parsed.subtitle,
+                    timestamp = System.currentTimeMillis(),
+                    isSaved = true,
+                    isCreated = true
+                )
+            )
+            Toast.makeText(getApplication(), "Saved to Saved Codes", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun saveBitmapToGallery(bitmap: Bitmap, filename: String = "ABScanner_${System.currentTimeMillis()}") {
+        val context = getApplication<Application>()
+        try {
+            val values = android.content.ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, "$filename.png")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ABScanner")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
+
+            val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri != null) {
+                val out: OutputStream? = context.contentResolver.openOutputStream(uri)
+                if (out != null) {
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    out.flush()
+                    out.close()
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    values.clear()
+                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                    context.contentResolver.update(uri, values, null, null)
+                }
+
+                Toast.makeText(context, "Saved image to Pictures/ABScanner", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "Failed to save image: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun copyToClipboard(text: String, isSensitive: Boolean = false) {
+        val context = getApplication<Application>()
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText("ABScanner", text)
+        if (isSensitive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val extras = PersistableBundle().apply {
+                putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+            clip.description.extras = extras
+        }
+        clipboard.setPrimaryClip(clip)
+        Toast.makeText(context, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+    }
+
+    fun shareText(text: String) {
+        val context = getApplication<Application>()
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, text)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        val chooser = Intent.createChooser(intent, "Share code content").apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        context.startActivity(chooser)
+    }
+
+    fun shareBitmap(bitmap: Bitmap) {
+        val context = getApplication<Application>()
+        try {
+            val path = MediaStore.Images.Media.insertImage(context.contentResolver, bitmap, "ABScanner_Share", null)
+            val uri = Uri.parse(path)
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            val chooser = Intent.createChooser(intent, "Share code image").apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(chooser)
+        } catch (_: Exception) {
+            shareText(lastScannedRaw)
+        }
+    }
+
+    // Execute Smart Primary Actions
+    fun executePrimaryAction(parsed: ParsedCode) {
+        val context = getApplication<Application>()
+        try {
+            when (parsed.type) {
+                CodeType.URL -> {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(parsed.rawValue)).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.PHONE -> {
+                    val intent = Intent(Intent.ACTION_DIAL, Uri.parse(parsed.primaryActionIntentUri ?: "tel:${parsed.rawValue}")).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.SMS -> {
+                    val intent = Intent(Intent.ACTION_SENDTO, Uri.parse(parsed.primaryActionIntentUri ?: "sms:${parsed.rawValue}")).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.EMAIL -> {
+                    val intent = Intent(Intent.ACTION_SENDTO, Uri.parse(parsed.primaryActionIntentUri ?: "mailto:${parsed.rawValue}")).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.GEO -> {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(parsed.rawValue)).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.CONTACT -> {
+                    val intent = Intent(Intent.ACTION_INSERT, ContactsContract.Contacts.CONTENT_URI).apply {
+                        val nameField = parsed.fields.find { it.label == "Full Name" }?.value
+                        val phoneField = parsed.fields.find { it.label == "Phone" }?.value
+                        val emailField = parsed.fields.find { it.label == "Email" }?.value
+                        nameField?.let { putExtra(ContactsContract.Intents.Insert.NAME, it) }
+                        phoneField?.let { putExtra(ContactsContract.Intents.Insert.PHONE, it) }
+                        emailField?.let { putExtra(ContactsContract.Intents.Insert.EMAIL, it) }
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.CALENDAR -> {
+                    val intent = Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI).apply {
+                        val summary = parsed.fields.find { it.label == "Event Title" }?.value ?: parsed.title
+                        val location = parsed.fields.find { it.label == "Location" }?.value
+                        putExtra(CalendarContract.Events.TITLE, summary)
+                        location?.let { putExtra(CalendarContract.Events.EVENT_LOCATION, it) }
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.PRODUCT, CodeType.ISBN -> {
+                    val uri = parsed.primaryActionIntentUri ?: ("https://www.google.com/search?q=" + Uri.encode(parsed.rawValue))
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(uri)).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                CodeType.WIFI -> {
+                    // Open Wi-Fi settings or copy password
+                    val pass = parsed.fields.find { it.isSensitive }?.value
+                    if (!pass.isNullOrEmpty()) {
+                        copyToClipboard(pass, isSensitive = true)
+                        Toast.makeText(context, "Wi-Fi password copied! Opening Wi-Fi settings...", Toast.LENGTH_LONG).show()
+                    }
+                    val intent = Intent(android.provider.Settings.ACTION_WIFI_SETTINGS).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    context.startActivity(intent)
+                }
+                else -> {
+                    if (parsed.primaryActionIntentUri != null) {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(parsed.primaryActionIntentUri)).apply {
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        }
+                        context.startActivity(intent)
+                    } else {
+                        copyToClipboard(parsed.rawValue)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "Unable to launch action: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // Settings Updates
+    fun updateTheme(theme: String) = viewModelScope.launch { repository.updateTheme(theme) }
+    fun updateLanguage(lang: String) = viewModelScope.launch { repository.updateLanguage(lang) }
+    fun updateAutoOpenLinks(enabled: Boolean) = viewModelScope.launch { repository.updateAutoOpenLinks(enabled) }
+    fun updateWifiBehavior(behavior: String) = viewModelScope.launch { repository.updateWifiBehavior(behavior) }
+    fun updateBeep(enabled: Boolean) = viewModelScope.launch { repository.updateBeep(enabled) }
+    fun updateVibrate(enabled: Boolean) = viewModelScope.launch { repository.updateVibrate(enabled) }
+    fun updateKeepScreenOn(enabled: Boolean) = viewModelScope.launch { repository.updateKeepScreenOn(enabled) }
+    fun updateScanSpeed(speed: String) = viewModelScope.launch { repository.updateScanSpeed(speed) }
+    fun updateSearchEngine(engine: String) = viewModelScope.launch { repository.updateSearchEngine(engine) }
+    fun updateStartInBatchMode(enabled: Boolean) = viewModelScope.launch { repository.updateStartInBatchMode(enabled) }
+    fun updateFlagSecure(enabled: Boolean) = viewModelScope.launch { repository.updateFlagSecure(enabled) }
+
+    suspend fun exportBackupJson(): String = repository.exportJson(historyList.value)
+    suspend fun importBackupJson(json: String): Int = repository.importJson(json)
+
+    private fun getFormatName(format: Int): String {
+        return when (format) {
+            Barcode.FORMAT_QR_CODE -> "QR Code"
+            Barcode.FORMAT_DATA_MATRIX -> "Data Matrix"
+            Barcode.FORMAT_AZTEC -> "Aztec"
+            Barcode.FORMAT_PDF417 -> "PDF417"
+            Barcode.FORMAT_EAN_13 -> "EAN-13"
+            Barcode.FORMAT_EAN_8 -> "EAN-8"
+            Barcode.FORMAT_UPC_A -> "UPC-A"
+            Barcode.FORMAT_UPC_E -> "UPC-E"
+            Barcode.FORMAT_CODE_128 -> "Code 128"
+            Barcode.FORMAT_CODE_39 -> "Code 39"
+            Barcode.FORMAT_CODE_93 -> "Code 93"
+            Barcode.FORMAT_CODABAR -> "Codabar"
+            Barcode.FORMAT_ITF -> "ITF"
+            else -> "Barcode"
+        }
+    }
+}
